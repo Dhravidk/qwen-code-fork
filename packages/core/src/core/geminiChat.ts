@@ -38,6 +38,10 @@ import {
 import { handleFallback } from '../fallback/handler.js';
 import { isFunctionResponse } from '../utils/messageInspectors.js';
 import { partListUnionToString } from './geminiRequest.js';
+import {
+  attachEtgContextToHistory,
+  logEtgEvent,
+} from '../utils/etgIntegration.js';
 import { uiTelemetryService } from '../telemetry/uiTelemetry.js';
 
 export enum StreamEventType {
@@ -253,19 +257,30 @@ export class GeminiChat {
 
     const userContent = createUserContent(params.message);
 
+    const userMessage = Array.isArray(params.message)
+      ? params.message
+      : [params.message];
+    const userMessageContent = partListUnionToString(toParts(userMessage));
+
     // Record user input - capture complete message with all parts (text, files, images, etc.)
     // but skip recording function responses (tool call results) as they should be stored in tool call records
     if (!isFunctionResponse(userContent)) {
-      const userMessage = Array.isArray(params.message)
-        ? params.message
-        : [params.message];
-      const userMessageContent = partListUnionToString(toParts(userMessage));
       this.chatRecordingService.recordMessage({
         model,
         type: 'user',
         content: userMessageContent,
       });
     }
+
+    await logEtgEvent(this.config, 'task_start', {
+      user_prompt: userMessageContent,
+    });
+
+    await attachEtgContextToHistory(
+      this.config,
+      this.history,
+      userMessageContent,
+    );
 
     // Add user content to history ONCE before any attempts.
     this.history.push(userContent);
@@ -299,6 +314,7 @@ export class GeminiChat {
             }
 
             lastError = null;
+            await logEtgEvent(self.config, 'task_end', { status: 'success' });
             break;
           } catch (error) {
             lastError = error;
@@ -331,6 +347,10 @@ export class GeminiChat {
         }
 
         if (lastError) {
+          await logEtgEvent(self.config, 'task_end', {
+            status: 'failed',
+            message: String(lastError),
+          });
           if (lastError instanceof InvalidStreamError) {
             logContentRetryFailure(
               self.config,
