@@ -54,6 +54,7 @@
   {
     "label": "Development",
     "items": [
+      { "label": "ETG & Code Graph Roadmap", "slug": "docs/development/etg-graph-roadmap" },
       { "label": "NPM", "slug": "docs/npm" },
       { "label": "Releases", "slug": "docs/releases" }
     ]
