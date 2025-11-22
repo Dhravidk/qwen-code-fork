@@ -87,110 +87,282 @@ walker LogEvent {
     has kind: str;
     has payload: dict;
 
+    # Expected payloads align with docs/INTERFACES.md:
+    #   task_start  -> { user_prompt: str, tags?: list, concepts?: list, task_id?: str }
+    #   step        -> { order: int, role?: str, llm_summary?: str, files_touched?: list, step_id?: str }
+    #   tool_start  -> { tool_name: str, params_json?: dict, files_touched?: list, invocation_id?: str, step_id?: str }
+    #   tool_end    -> { tool_name: str, success: bool, duration_ms?: int, stdout?: str, stderr?: str,
+    #                    files_touched?: list, invocation_id?: str, step_id?: str }
+    #   checkpoint  -> { checkpoint_file: str, created_at?: str, step_id?: str }
+    #   error       -> { error_type: str, message: str, raw_log_excerpt?: str, error_id?: str, step_id?: str }
+    #   task_end    -> { status: str }
+    # The walker returns correlation hints: { task_id, step_id | null, tool_id | null }.
+
     root {
         assert project_root, "project_root is required";
         assert kind, "kind is required";
 
-        # Reuse or create the project node.
-        with project_node = spawn here ++:project {
-            .id = digest(project_root);
-            .root_path = project_root;
+        project_id = digest(project_root);
+
+        if here-->project(id=project_id) {
+            with project_node = here-->project(id=project_id) { }
+        } else {
+            with project_node = spawn here ++:project {
+                .id = project_id;
+                .root_path = project_root;
+            }
+        }
+
+        if payload.get("task_id", null) {
+            task_id = payload.task_id;
         }
 
         if kind == "task_start" {
-            task_id = payload.get("task_id", gen_uuid());
-            with t = spawn project_node ++:task {
-                .id = task_id;
-                .created_at = now();
-                .user_prompt = payload.user_prompt;
-                .project_id = project_node.id;
-                .status = "running";
-                .tags = payload.tags or [];
-                .files_touched = [];
-                .embedding = [];
+            if not task_id {
+                task_id = payload.get("task_id", gen_uuid());
             }
+
+            if project_node-->task(id=task_id) {
+                with task_node = project_node-->task(id=task_id) { }
+            } else {
+                with task_node = spawn project_node ++:task {
+                    .id = task_id;
+                    .created_at = payload.get("created_at", now());
+                    .user_prompt = payload.user_prompt;
+                    .project_id = project_node.id;
+                    .status = "running";
+                    .tags = payload.get("tags", []);
+                    .files_touched = [];
+                    .embedding = [];
+                }
+            }
+
+            for concept_label in payload.get("concepts", []) {
+                if project_node-->concept(label=concept_label) {
+                    with concept_node = project_node-->concept(label=concept_label) { }
+                } else {
+                    with concept_node = spawn project_node ++:concept {
+                        .label = concept_label;
+                        .description = "";
+                        .source = "manual";
+                    }
+                }
+                connect(task_node, concept_node, task_related_to_concept);
+            }
+
             report {"task_id": task_id, "step_id": null, "tool_id": null};
         }
 
         if kind == "step" {
             assert task_id, "step requires a task_id";
-            with t = project_node-->task(id=task_id) { }
-            with s = spawn project_node ++:step {
-                .id = payload.get("step_id", gen_uuid());
+
+            if project_node-->task(id=task_id) {
+                with task_node = project_node-->task(id=task_id) { }
+            } else {
+                with task_node = spawn project_node ++:task {
+                    .id = task_id;
+                    .created_at = payload.get("created_at", now());
+                    .user_prompt = "";
+                    .project_id = project_node.id;
+                    .status = "running";
+                    .tags = [];
+                    .files_touched = [];
+                    .embedding = [];
+                }
+            }
+
+            step_id = payload.get("step_id", gen_uuid());
+            with step_node = spawn project_node ++:step {
+                .id = step_id;
                 .order = payload.order;
                 .role = payload.get("role", "");
                 .llm_summary = payload.get("llm_summary", "");
                 .files_touched = payload.get("files_touched", []);
                 .embedding = [];
             }
-            connect(t, s, task_has_step);
-            report {"task_id": task_id, "step_id": s.id, "tool_id": null};
+            connect(task_node, step_node, task_has_step);
+            report {"task_id": task_id, "step_id": step_node.id, "tool_id": null};
         }
 
         if kind == "tool_start" {
             assert task_id, "tool_start requires a task_id";
-            with current_step = latest(project_node, task_id) { }
-            with tool = spawn project_node ++:tool_invocation {
-                .id = gen_uuid();
+
+            if project_node-->task(id=task_id) {
+                with task_node = project_node-->task(id=task_id) { }
+            }
+
+            with current_step = null;
+            if payload.get("step_id", null) {
+                with current_step = project_node-->step(id=payload.step_id) { }
+            } else {
+                for s in task_node-->task_has_step { current_step = s; }
+            }
+
+            assert current_step, "step must exist before tool_start";
+
+            tool_id = payload.get("invocation_id", gen_uuid());
+            with tool_node = spawn project_node ++:tool_invocation {
+                .id = tool_id;
                 .tool_name = payload.tool_name;
                 .params_json = payload.get("params_json", {});
-                .started_at = now();
+                .started_at = payload.get("started_at", now());
+                .duration_ms = 0;
+                .success = true;
+                .stdout = "";
+                .stderr = "";
                 .files_touched = payload.get("files_touched", []);
             }
-            connect(current_step, tool, step_invokes_tool);
+            connect(current_step, tool_node, step_invokes_tool);
+
             for f_path in payload.get("files_touched", []) {
-                if f_path has file_node {
-                    connect(tool, file_node, tool_touches_file);
+                if project_node-->file(path=f_path) {
+                    with file_node = project_node-->file(path=f_path) { }
+                } else {
+                    with file_node = spawn project_node ++:file {
+                        .path = f_path;
+                        .language = "";
+                        .size_bytes = 0;
+                        .hash = "";
+                        .last_modified = "";
+                    }
                 }
+                connect(tool_node, file_node, tool_touches_file);
             }
-            report {"task_id": task_id, "step_id": current_step.id, "tool_id": tool.id};
+
+            for touched in payload.get("files_touched", []) {
+                if touched not in current_step.files_touched { current_step.files_touched.append(touched); }
+                if task_node and touched not in task_node.files_touched { task_node.files_touched.append(touched); }
+            }
+
+            report {"task_id": task_id, "step_id": current_step.id, "tool_id": tool_node.id};
         }
 
         if kind == "tool_end" {
             assert task_id, "tool_end requires a task_id";
-            with current_step = latest(project_node, task_id) { }
-            with tool = latest_tool(current_step, payload.tool_name) { }
-            tool.success = payload.success;
-            tool.duration_ms = payload.get("duration_ms", 0);
-            tool.stdout = payload.get("stdout", "");
-            tool.stderr = payload.get("stderr", "");
-            if payload.get("files_touched", []) {
-                tool.files_touched = payload.files_touched;
+
+            if project_node-->task(id=task_id) {
+                with task_node = project_node-->task(id=task_id) { }
             }
-            for f_path in tool.files_touched {
-                if f_path has file_node {
-                    connect(tool, file_node, tool_touches_file);
+
+            with current_step = null;
+            if payload.get("step_id", null) {
+                with current_step = project_node-->step(id=payload.step_id) { }
+            } else {
+                for s in task_node-->task_has_step { current_step = s; }
+            }
+
+            assert current_step, "step must exist before tool_end";
+
+            with tool_node = null;
+            if payload.get("invocation_id", null) and project_node-->tool_invocation(id=payload.invocation_id) {
+                with tool_node = project_node-->tool_invocation(id=payload.invocation_id) { }
+            } else {
+                for candidate in current_step-->step_invokes_tool { if candidate.tool_name == payload.tool_name { tool_node = candidate; } }
+            }
+
+            if not tool_node {
+                with tool_node = spawn project_node ++:tool_invocation {
+                    .id = payload.get("invocation_id", gen_uuid());
+                    .tool_name = payload.tool_name;
+                    .params_json = payload.get("params_json", {});
+                    .started_at = payload.get("started_at", now());
+                    .files_touched = payload.get("files_touched", []);
                 }
+                connect(current_step, tool_node, step_invokes_tool);
             }
-            report {"task_id": task_id, "step_id": current_step.id, "tool_id": tool.id};
+
+            tool_node.success = payload.success;
+            tool_node.duration_ms = payload.get("duration_ms", tool_node.duration_ms or 0);
+            tool_node.stdout = payload.get("stdout", tool_node.stdout or "");
+            tool_node.stderr = payload.get("stderr", tool_node.stderr or "");
+            if payload.get("files_touched", []) {
+                tool_node.files_touched = payload.files_touched;
+            }
+
+            for f_path in tool_node.files_touched {
+                if project_node-->file(path=f_path) {
+                    with file_node = project_node-->file(path=f_path) { }
+                } else {
+                    with file_node = spawn project_node ++:file {
+                        .path = f_path;
+                        .language = "";
+                        .size_bytes = 0;
+                        .hash = "";
+                        .last_modified = "";
+                    }
+                }
+                connect(tool_node, file_node, tool_touches_file);
+                if current_step and f_path not in current_step.files_touched { current_step.files_touched.append(f_path); }
+                if task_node and f_path not in task_node.files_touched { task_node.files_touched.append(f_path); }
+            }
+
+            report {"task_id": task_id, "step_id": current_step.id, "tool_id": tool_node.id};
         }
 
         if kind == "checkpoint" {
-            with current_step = latest(project_node, task_id) { }
-            with c = spawn current_step ++:checkpoint_node {
-                .id = gen_uuid();
+            assert task_id, "checkpoint requires a task_id";
+
+            with current_step = null;
+            if payload.get("step_id", null) {
+                with current_step = project_node-->step(id=payload.step_id) { }
+            } else {
+                for s in project_node-->step { current_step = s; }
+            }
+
+            assert current_step, "step must exist before checkpoint";
+
+            checkpoint_id = payload.get("checkpoint_id", gen_uuid());
+            with checkpoint_node = spawn current_step ++:checkpoint_node {
+                .id = checkpoint_id;
                 .checkpoint_file = payload.checkpoint_file;
                 .created_at = payload.get("created_at", now());
             }
-            connect(current_step, c, step_has_checkpoint);
+            connect(current_step, checkpoint_node, step_has_checkpoint);
             report {"task_id": task_id, "step_id": current_step.id, "tool_id": null};
         }
 
         if kind == "error" {
-            with current_step = latest(project_node, task_id) { }
-            with e = spawn current_step ++:error {
-                .id = gen_uuid();
+            assert task_id, "error requires a task_id";
+
+            with current_step = null;
+            if payload.get("step_id", null) {
+                with current_step = project_node-->step(id=payload.step_id) { }
+            } else {
+                for s in project_node-->step { current_step = s; }
+            }
+
+            assert current_step, "step must exist before error";
+
+            error_id = payload.get("error_id", gen_uuid());
+            with error_node = spawn current_step ++:error {
+                .id = error_id;
                 .error_type = payload.error_type;
                 .message = payload.message;
                 .raw_log_excerpt = payload.get("raw_log_excerpt", "");
             }
-            connect(current_step, e, step_has_error);
+            connect(current_step, error_node, step_has_error);
             report {"task_id": task_id, "step_id": current_step.id, "tool_id": null};
         }
 
         if kind == "task_end" {
-            with t = project_node-->task(id=task_id) { }
-            t.status = payload.status;
+            assert task_id, "task_end requires a task_id";
+
+            if project_node-->task(id=task_id) {
+                with task_node = project_node-->task(id=task_id) { }
+            } else {
+                with task_node = spawn project_node ++:task {
+                    .id = task_id;
+                    .created_at = payload.get("created_at", now());
+                    .user_prompt = "";
+                    .project_id = project_node.id;
+                    .status = "running";
+                    .tags = [];
+                    .files_touched = [];
+                    .embedding = [];
+                }
+            }
+
+            task_node.status = payload.status;
             report {"task_id": task_id, "step_id": null, "tool_id": null};
         }
     }
