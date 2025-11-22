@@ -13,6 +13,14 @@ The server can be launched directly with Python:
 python -m jaseci_mcp_etg
 ```
 
+By default the server uses the bundled JSON storage backend. To force the
+Jac/Jaseci runtime (once the optional `jaclang` dependency is installed), set
+`JASECI_ETG_BACKEND=jac`:
+
+```bash
+JASECI_ETG_BACKEND=jac python -m jaseci_mcp_etg
+```
+
 During development you can process a single JSON-RPC request (newline-separated)
 by passing `--once`:
 
@@ -44,9 +52,18 @@ Add the server to `.qwen/settings.json` so Qwen Code can discover the tools:
 }
 ```
 
+This repository also ships a ready-to-use example at `.qwen/settings.json` that
+matches the configuration above.
+
 ## Tool behavior
 
 All tool parameters and responses follow the schemas frozen in
-`docs/INTERFACES.md`. This Python implementation maintains a minimal persisted
-state under `~/.qwen/graphs/<project_hash>/project.json` so callers can exercise
-ETG logging and graph indexing flows without requiring a full Jaseci runtime.
+`docs/INTERFACES.md`. The Python package now ships two backends:
+
+- **Storage backend (default):** persists lightweight graph + ETG state under
+  `~/.qwen/graphs/<project_hash>/project.json` so callers can exercise flows
+  without extra dependencies.
+- **Jac backend (optional):** loads the Jac schema and production walkers in
+  `jac/` to run against a real Jaseci runtime. Enable with
+  `JASECI_ETG_BACKEND=jac` and ensure `jaclang` is installed in the environment
+  where the MCP server runs.
