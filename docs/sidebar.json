@@ -56,7 +56,15 @@
     "items": [
       { "label": "ETG & Code Graph Roadmap", "slug": "docs/development/etg-graph-roadmap" },
       { "label": "NPM", "slug": "docs/npm" },
-      { "label": "Releases", "slug": "docs/releases" }
+      { "label": "Releases", "slug": "docs/releases" },
+      {
+        "label": "ETG Agent Workflow",
+        "slug": "docs/development/etg-agent-workflow"
+      },
+      {
+        "label": "ETG Interfaces",
+        "slug": "docs/development/etg-interfaces"
+      }
     ]
   },
   {
