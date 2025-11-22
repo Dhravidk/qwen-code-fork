@@ -1,5 +1,6 @@
 export default {
   architecture: 'Architecture',
+  'etg-graph-roadmap': 'ETG & Code Graph Roadmap',
   npm: 'NPM',
   deployment: 'Deployment',
   telemetry: 'Telemetry',
