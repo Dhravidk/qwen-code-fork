@@ -42,6 +42,9 @@ import { doesToolInvocationMatch } from '../utils/tool-utils.js';
 import levenshtein from 'fast-levenshtein';
 import { getPlanModeSystemReminder } from './prompts.js';
 import { ShellToolInvocation } from '../tools/shell.js';
+import { logEtgEvent } from '../utils/etgIntegration.js';
+import { partToString } from '../utils/partUtils.js';
+import { safeJsonStringify } from '../utils/safeJsonStringify.js';
 
 export type ValidatingToolCall = {
   status: 'validating';
@@ -988,6 +991,25 @@ export class CoreToolScheduler {
         const invocation = scheduledCall.invocation;
         this.setStatusInternal(callId, 'executing');
 
+        const filesTouched =
+          invocation.toolLocations?.().map((loc) => loc.path) ?? [];
+        const startedAt = Date.now();
+        let toolEndLogged = false;
+        const logToolEnd = async (
+          payload: Record<string, unknown>,
+        ): Promise<void> => {
+          if (toolEndLogged) return;
+          toolEndLogged = true;
+          await logEtgEvent(this.config, 'tool_end', payload);
+        };
+
+        await logEtgEvent(this.config, 'tool_start', {
+          tool_name: toolName,
+          params_json: safeJsonStringify(invocation.params),
+          files_touched: filesTouched,
+          started_at: new Date(startedAt).toISOString(),
+        });
+
         const liveOutputCallback = scheduledCall.tool.canUpdateOutput
           ? (outputChunk: ToolResultDisplay) => {
               if (this.outputUpdateHandler) {
@@ -1035,6 +1057,13 @@ export class CoreToolScheduler {
         try {
           const toolResult: ToolResult = await promise;
           if (signal.aborted) {
+            await logToolEnd({
+              tool_name: toolName,
+              success: false,
+              duration_ms: Date.now() - startedAt,
+              stderr: 'User cancelled tool execution.',
+              files_touched: filesTouched,
+            });
             this.setStatusInternal(
               callId,
               'cancelled',
@@ -1090,6 +1119,13 @@ export class CoreToolScheduler {
               callId,
               content,
             );
+            await logToolEnd({
+              tool_name: toolName,
+              success: true,
+              duration_ms: Date.now() - startedAt,
+              stdout: partToString(toolResult.llmContent),
+              files_touched: filesTouched,
+            });
             const successResponse: ToolCallResponseInfo = {
               callId,
               responseParts: response,
@@ -1108,16 +1144,37 @@ export class CoreToolScheduler {
               error,
               toolResult.error.type,
             );
+            await logToolEnd({
+              tool_name: toolName,
+              success: false,
+              duration_ms: Date.now() - startedAt,
+              stderr: toolResult.error.message,
+              files_touched: filesTouched,
+            });
             this.setStatusInternal(callId, 'error', errorResponse);
           }
         } catch (executionError: unknown) {
           if (signal.aborted) {
+            await logToolEnd({
+              tool_name: toolName,
+              success: false,
+              duration_ms: Date.now() - startedAt,
+              stderr: 'User cancelled tool execution.',
+              files_touched: filesTouched,
+            });
             this.setStatusInternal(
               callId,
               'cancelled',
               'User cancelled tool execution.',
             );
           } else {
+            await logToolEnd({
+              tool_name: toolName,
+              success: false,
+              duration_ms: Date.now() - startedAt,
+              stderr: String(executionError),
+              files_touched: filesTouched,
+            });
             this.setStatusInternal(
               callId,
               'error',
