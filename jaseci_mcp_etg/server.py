@@ -15,8 +15,8 @@ import sys
 import time
 from typing import Any, Dict, Iterable, List, Optional
 
+from .backend import BackendUnavailable, GraphBackend, select_backend
 from .schemas import get_tool_definitions
-from .storage import ProjectStorage
 
 PROTOCOL_VERSION = "2025-06-18"
 
@@ -29,8 +29,8 @@ class JsonRpcError(Exception):
 
 
 class JaseciMcpServer:
-    def __init__(self, storage: Optional[ProjectStorage] = None) -> None:
-        self.storage = storage or ProjectStorage()
+    def __init__(self, backend: Optional[GraphBackend] = None) -> None:
+        self.backend = backend or select_backend()
         self.tools = get_tool_definitions()
 
     # Protocol handlers
@@ -69,7 +69,7 @@ class JaseciMcpServer:
         return {
             "protocolVersion": PROTOCOL_VERSION,
             "capabilities": {"tools": {"listChanged": False}},
-            "serverInfo": {"name": "jaseci_mcp_etg", "version": "0.1.0"},
+            "serverInfo": {"name": "jaseci_mcp_etg", "version": "0.2.0"},
         }
 
     def _handle_tools_list(self) -> Dict[str, Any]:
@@ -100,7 +100,7 @@ class JaseciMcpServer:
         project_root = os.path.abspath(self._require(args, "project_root"))
         mode = args.get("mode", "full")
         started = time.time()
-        stats = self.storage.index_project(project_root, mode=mode)
+        stats = self.backend.index_project(project_root, mode=mode)
         stats["duration_ms"] = int((time.time() - started) * 1000)
         return stats
 
@@ -108,7 +108,7 @@ class JaseciMcpServer:
         project_root = os.path.abspath(self._require(args, "project_root"))
         paths: Iterable[str] = self._require(args, "paths")
         started = time.time()
-        stats = self.storage.update_files(project_root, paths)
+        stats = self.backend.update_files(project_root, paths)
         stats["duration_ms"] = int((time.time() - started) * 1000)
         return stats
 
@@ -117,21 +117,24 @@ class JaseciMcpServer:
         task_id = args.get("task_id")
         kind = self._require(args, "kind")
         payload = self._require(args, "payload")
-        return self.storage.log_event(project_root, task_id, kind, payload)
+        try:
+            return self.backend.log_event(project_root, task_id, kind, payload)
+        except BackendUnavailable as exc:
+            raise JsonRpcError(-32001, str(exc))
 
     def etg_query_similar_attempts(self, args: Dict[str, Any]) -> Dict[str, Any]:
         project_root = os.path.abspath(self._require(args, "project_root"))
         query = self._require(args, "query")
         file_paths: Optional[List[str]] = args.get("file_paths")
         limit = int(args.get("limit", 5))
-        result = self.storage.query_similar(project_root, query, file_paths, limit)
+        result = self.backend.query_similar(project_root, query, file_paths, limit)
         return result
 
     def graph_context_for_files(self, args: Dict[str, Any]) -> Dict[str, Any]:
         project_root = os.path.abspath(self._require(args, "project_root"))
         file_paths = self._require(args, "file_paths")
         radius = int(args.get("radius", 1))
-        return self.storage.context_for_files(project_root, list(file_paths), radius)
+        return self.backend.context_for_files(project_root, list(file_paths), radius)
 
     # Utilities
     @staticmethod
@@ -150,9 +153,15 @@ def main() -> None:
         action="store_true",
         help="Process a single JSON-RPC request from stdin (for debugging).",
     )
+    parser.add_argument(
+        "--backend",
+        choices=["auto", "jac", "storage"],
+        default=os.getenv("JASECI_ETG_BACKEND", "auto"),
+        help="Choose backend implementation (auto tries Jac then storage).",
+    )
     args = parser.parse_args()
 
-    server = JaseciMcpServer()
+    server = JaseciMcpServer(select_backend(args.backend))
 
     if args.once:
         line = sys.stdin.readline()

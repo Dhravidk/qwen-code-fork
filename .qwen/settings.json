@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "jaseci-etg": {
+      "command": "python",
+      "args": ["-m", "jaseci_mcp_etg"],
+      "timeout": 600000,
+      "trust": true,
+      "includeTools": [
+        "graph_index_project",
+        "graph_update_files",
+        "etg_log_event",
+        "etg_query_similar_attempts",
+        "graph_context_for_files"
+      ]
+    }
+  }
+}
