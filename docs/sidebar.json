@@ -55,7 +55,15 @@
     "label": "Development",
     "items": [
       { "label": "NPM", "slug": "docs/npm" },
-      { "label": "Releases", "slug": "docs/releases" }
+      { "label": "Releases", "slug": "docs/releases" },
+      {
+        "label": "ETG Agent Workflow",
+        "slug": "docs/development/etg-agent-workflow"
+      },
+      {
+        "label": "ETG Interfaces",
+        "slug": "docs/development/etg-interfaces"
+      }
     ]
   },
   {
