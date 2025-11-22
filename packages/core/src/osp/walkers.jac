@@ -8,76 +8,170 @@
 # a full runtime.
 
 walker IndexProject {
-    has project_root: str;
+    has root_path: str;
     has mode: str = "full"; # "full" or "incremental"
+    has stats: dict;
+
+    can normalize_path(path: str) -> str {
+        py {
+            import os
+            return os.path.abspath(path)
+        }
+    }
+
+    can parent_dir(path: str) -> str {
+        py {
+            import os
+            return os.path.abspath(os.path.dirname(path))
+        }
+    }
+
+    can walk_fs(root: str) -> list {
+        py {
+            import os
+            results = []
+            for current, dirs, files in os.walk(root):
+                results.append({
+                    "dir": os.path.abspath(current),
+                    "dirs": [os.path.join(current, d) for d in dirs],
+                    "files": [os.path.join(current, f) for f in files],
+                })
+            return results
+        }
+    }
+
+    can file_meta(path: str) -> dict {
+        py {
+            import os
+            from datetime import datetime
+            st = os.stat(path)
+            return {
+                "size": st.st_size,
+                "mtime": st.st_mtime,
+                "mtime_str": datetime.fromtimestamp(st.st_mtime).isoformat(),
+            }
+        }
+    }
+
+    can hash_file(path: str) -> str {
+        py {
+            import hashlib
+            h = hashlib.sha256()
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(8192), b""):
+                    h.update(chunk)
+            return h.hexdigest()
+        }
+    }
+
+    can detect_language(path: str) -> str {
+        py {
+            import os
+            ext = os.path.splitext(path)[1].lower()
+            mapping = {
+                ".py": "python",
+                ".ts": "typescript",
+                ".tsx": "tsx",
+                ".js": "javascript",
+                ".jsx": "jsx",
+                ".rs": "rust",
+                ".java": "java",
+                ".go": "go",
+                ".cpp": "cpp",
+                ".c": "c",
+                ".h": "c",
+                ".md": "markdown",
+                ".json": "json",
+                ".yaml": "yaml",
+                ".yml": "yaml",
+            }
+            return mapping.get(ext, "unknown")
+        }
+    }
 
     root {
-        assert project_root, "project_root is required";
-        # Ensure a single project node exists for the root path.
-        with entry_project = spawn here ++:project {
-            .id = digest(project_root);
-            .root_path = project_root;
+        assert root_path, "root_path is required";
+        normalized_root = normalize_path(root_path);
+        mode = mode or "full";
+        stats = {
+            "dirs_seen": 0,
+            "dirs_created": 0,
+            "files_created": 0,
+            "files_updated": 0,
+            "files_skipped": 0,
+        };
+
+        with project_node = spawn here ++:project {
+            .id = digest(normalized_root);
+            .root_path = normalized_root;
         }
 
-        # Traverse the filesystem to build directories, files, and symbol edges.
-        files_indexed = 0;
-        symbols_indexed = 0;
-        concepts_indexed = 0;
+        dir_cache = {};
 
-        for dir_path in fs.dir_walk(project_root) {
-            with d = spawn here ++:directory {
+        for entry in walk_fs(normalized_root) {
+            dir_path = normalize_path(entry.dir);
+            stats.dirs_seen += 1;
+
+            with dir_node = spawn here ++:directory {
                 .path = dir_path;
             }
-            connect(entry_project, d, project_contains_dir);
+            if not dir_cache.get(dir_path) { stats.dirs_created += 1; }
+            dir_cache[dir_path] = dir_node;
 
-            for subdir in fs.list_dirs(dir_path) {
-                with sd = spawn here ++:directory {
-                    .path = subdir;
+            if dir_path == normalized_root {
+                connect(project_node, dir_node, project_contains_dir);
+            } else {
+                p_path = parent_dir(dir_path);
+                if not dir_cache.get(p_path) {
+                    with parent_node = spawn here ++:directory { .path = p_path; }
+                    dir_cache[p_path] = parent_node;
                 }
-                connect(d, sd, dir_contains_dir);
+                connect(dir_cache[p_path], dir_node, dir_contains_dir);
             }
 
-            for f_path in fs.list_files(dir_path) {
-                meta = fs.meta(f_path);
-                with f = spawn here ++:file {
-                    .path = f_path;
-                    .language = detect_lang(f_path);
-                    .size_bytes = meta.size;
-                    .hash = digest_file(f_path);
-                    .last_modified = meta.mtime;
+            for subdir in entry.dirs {
+                sub_path = normalize_path(subdir);
+                if not dir_cache.get(sub_path) {
+                    with child_dir = spawn here ++:directory { .path = sub_path; }
+                    dir_cache[sub_path] = child_dir;
+                    stats.dirs_created += 1;
                 }
-                files_indexed += 1;
-                connect(d, f, dir_contains_file);
+            }
 
-                for sym in parse_symbols(f_path) {
-                    with s = spawn here ++:symbol {
-                        .name = sym.name;
-                        .kind = sym.kind;
-                        .signature = sym.signature;
-                        .span_start_line = sym.span.start;
-                        .span_end_line = sym.span.end;
-                        .docstring = sym.docstring;
-                    }
-                    symbols_indexed += 1;
-                    connect(f, s, file_contains_symbol);
-                    for call in sym.calls {
-                        connect(s, call, symbol_calls_symbol);
-                    }
-                    for tested in sym.tests {
-                        connect(s, tested, symbol_tests_symbol);
-                    }
-                    for concept in sym.concepts {
-                        connect(s, concept, symbol_implements_concept);
-                        concepts_indexed += 1;
-                    }
+            for f_path in entry.files {
+                normalized_file = normalize_path(f_path);
+                meta = file_meta(normalized_file);
+                new_hash = hash_file(normalized_file);
+
+                with file_node = spawn here ++:file { .path = normalized_file; }
+                old_hash = file_node.hash;
+                old_mtime = file_node.last_modified;
+
+                needs_update = mode == "full" or old_hash == null or old_mtime == null or old_hash != new_hash or old_mtime != meta.mtime_str;
+
+                if needs_update {
+                    file_node.language = detect_language(normalized_file);
+                    file_node.size_bytes = meta.size;
+                    file_node.hash = new_hash;
+                    file_node.last_modified = meta.mtime_str;
+                    if old_hash == null { stats.files_created += 1; } else { stats.files_updated += 1; }
+                } else {
+                    stats.files_skipped += 1;
                 }
+
+                connect(dir_node, file_node, dir_contains_file);
             }
         }
 
-        report {"files_indexed": files_indexed,
-                "symbols_indexed": symbols_indexed,
-                "concepts_indexed": concepts_indexed,
-                "duration_ms": timer.stop()};
+        report {
+            "project_root": normalized_root,
+            "mode": mode,
+            "dirs_seen": stats.dirs_seen,
+            "dirs_created": stats.dirs_created,
+            "files_created": stats.files_created,
+            "files_updated": stats.files_updated,
+            "files_skipped": stats.files_skipped,
+        };
     }
 }
 
@@ -273,5 +367,16 @@ walker ContextForFiles {
                                   "steps": unique(steps),
                                   "files": file_paths},
                 "returnDisplay": returnDisplay};
+    }
+}
+
+# Simple demonstration walker that exercises IndexProject and returns its summary
+walker DemoIndexProject {
+    has sample_root: str;
+
+    root {
+        assert sample_root, "sample_root is required";
+        summary = run_walker(IndexProject, {"root_path": sample_root, "mode": "full"});
+        report {"indexed_root": sample_root, "summary": summary};
     }
 }
