@@ -103,6 +103,15 @@ class ProjectStorage:
 
     # ETG operations
     def log_event(self, root: str, task_id: Optional[str], kind: str, payload: Dict) -> Dict[str, Optional[str]]:
+        """Record an ETG event for a project.
+
+        This is intentionally lightweight and schema-driven – it mirrors the
+        payload shapes defined in docs/INTERFACES.md so callers don't have to
+        know about internal storage layout.
+
+        All file paths are normalized relative to the project root so that
+        later queries can reliably match them.
+        """
         project = self._load(root)
         tasks = project.etg.setdefault("tasks", {})
         steps = project.etg.setdefault("steps", {})
@@ -115,32 +124,54 @@ class ProjectStorage:
         step_id: Optional[str] = None
         tool_id: Optional[str] = None
 
+        def _norm_files(files: Iterable[str] | None) -> List[str]:
+            out: List[str] = []
+            for f in files or []:
+                # Normalise relative paths against the project root so we can
+                # safely intersect with later query filters.
+                out.append(self._normalize_path(root, f))
+            # Preserve order but dedupe
+            seen = set()
+            deduped: List[str] = []
+            for f in out:
+                if f in seen:
+                    continue
+                seen.add(f)
+                deduped.append(f)
+            return deduped
+
         if kind == "task_start":
+            files = _norm_files(payload.get("files_touched"))
             tasks[task_id] = {
                 "id": task_id,
                 "created_at": payload.get("created_at") or _now_iso(),
                 "user_prompt": payload.get("user_prompt", ""),
                 "status": "running",
-                "tags": payload.get("tags", []),
-                "files_touched": [],
+                "tags": list(payload.get("tags", []) or []),
+                "files_touched": files,
             }
-            task_steps.setdefault(task_id, [])
         elif kind == "step":
+            # A new logical LLM step within the task.
+            existing_steps = task_steps.get(task_id, [])
+            order = len(existing_steps) + 1
             step_id = str(uuid.uuid4())
-            order = payload.get("order") or len(task_steps.get(task_id, [])) + 1
+            files = _norm_files(payload.get("files_touched"))
             step = {
                 "id": step_id,
                 "task_id": task_id,
                 "order": order,
                 "role": payload.get("role", ""),
                 "llm_summary": payload.get("llm_summary", ""),
-                "files_touched": [],
+                "files_touched": files,
             }
             steps[step_id] = step
             task_steps.setdefault(task_id, []).append(step_id)
+            self._merge_files_touched(step, tasks.get(task_id), files)
         elif kind == "tool_start":
+            # Ensure there is a current step to attach the tool to.
             step_id = self._ensure_step_for_task(task_id, task_steps, steps)
             tool_id = str(uuid.uuid4())
+            files = _norm_files(payload.get("files_touched"))
             tool = {
                 "id": tool_id,
                 "task_id": task_id,
@@ -148,23 +179,32 @@ class ProjectStorage:
                 "tool_name": payload.get("tool_name", ""),
                 "params_json": payload.get("params_json"),
                 "started_at": payload.get("started_at") or _now_iso(),
-                "files_touched": payload.get("files_touched", []) or [],
+                "duration_ms": 0,
                 "success": None,
+                "stdout": "",
+                "stderr": "",
+                "files_touched": files,
             }
             tools[tool_id] = tool
-            self._merge_files_touched(steps.get(step_id), tasks.get(task_id), tool["files_touched"])
+            self._merge_files_touched(steps.get(step_id), tasks.get(task_id), files)
         elif kind == "tool_end":
             tool_id = payload.get("tool_id") or self._latest_tool_id(tools, task_id)
             if tool_id and tool_id in tools:
                 tool = tools[tool_id]
-                tool["success"] = payload.get("success")
-                tool["duration_ms"] = payload.get("duration_ms")
-                tool["stdout"] = payload.get("stdout")
-                tool["stderr"] = payload.get("stderr")
-                new_files = payload.get("files_touched", []) or []
-                tool.setdefault("files_touched", [])
-                tool["files_touched"].extend([f for f in new_files if f not in tool["files_touched"]])
-                self._merge_files_touched(steps.get(tool.get("step_id")), tasks.get(task_id), new_files)
+                tool["success"] = bool(payload.get("success"))
+                tool["stdout"] = (payload.get("stdout", "") or "")
+                tool["stderr"] = (payload.get("stderr", "") or "")
+                duration = payload.get("duration_ms")
+                tool["duration_ms"] = int(duration) if duration is not None else tool.get("duration_ms", 0)
+                new_files = _norm_files(payload.get("files_touched"))
+                if new_files:
+                    # Merge into the tool itself.
+                    existing = tool.setdefault("files_touched", [])
+                    for f in new_files:
+                        if f not in existing:
+                            existing.append(f)
+                    # And propagate up to step/task.
+                    self._merge_files_touched(steps.get(tool.get("step_id")), tasks.get(task_id), new_files)
                 step_id = tool.get("step_id")
             else:
                 tool_id = None
